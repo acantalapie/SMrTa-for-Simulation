@@ -15,6 +15,7 @@ import time
 import statistics
 import json
 import sys
+import math
 
 class MRTASolver:
     """
@@ -70,6 +71,7 @@ class MRTASolver:
                  aps_list=None,
                  incremental=True,
                  debug=True):
+
         assert theory in ['QF_UFLIA', 'QF_UFBV']
         self.theory = theory
         self.agents = agents
@@ -115,6 +117,7 @@ class MRTASolver:
         self.current_sol = None
         self.old_batch_params = None
         self.current_batch_params = None
+        
 
     def allocate_task_stream(self, basename=None):
         times = []
@@ -307,7 +310,6 @@ class MRTASolver:
         self.task_drops = []
         self.task_agents = []
 
-
     def create_task_vars(self, num_tasks, task_set_k):
         if self.theory == 'QF_UFBV':
             # (task_start, task_drop, agent) for each task in this set
@@ -324,7 +326,6 @@ class MRTASolver:
         self.task_drops.append(task_drop)
         self.task_agents.append(t2a)
         return task_start, task_drop, t2a
-
 
     def build_init_constraints(self, agents, room_graph, num_aps, capacity, max_time, fidelity):
         num_agents = len(agents)
@@ -548,7 +549,309 @@ class MRTASolver:
         self.num_actions += num_tasks * 2
         return num_assigned_dps
                 
+    def greedy_append_only_earliest_finish(self, tasks, curr_time, previous_sol=None):
+        """
+        Greedy (append-only): asigna cada tarea al agente cuyo "finish time" estimado sea menor,
+        añadiendo siempre pickup+drop al FINAL de su cola futura.
 
+        Returns:
+            plan_actions: dict[int, list[int]]
+                plan_actions[a] = [action_id_0, action_id_1, ...] (solo acciones futuras)
+            task_to_agent: list[int]
+                task_to_agent[i] = agente asignado a la tarea local i del batch actual
+            next_free_dp: list[int]
+                next_free_dp[a] = primer decision point libre (según previous_sol/curr_time)
+        """
+        num_agents = len(self.agents)
+
+        # Mapa Python-side: action_id -> room_id (evaluación distancias en Greedy)
+        # Se rellena incrementalmente por batches
+        if not hasattr(self, "action_room"):
+            self.action_room = {a.id: a.start for a in self.agents}
+
+        # Calcular next_free_dp y esta "último comprometido" por agente - Estado inicial por agente
+        next_free_dp = [1 for _ in range(num_agents)] # next_free_dp[a] : primer decision point libre
+        last_time = [0 for _ in range(num_agents)] # last_time[a] : tiempo estimado al llegar a ese punto
+        last_action = [a for a in range(num_agents)] # last_action[a] : última acción ejecutada
+        last_room = [self.action_room[a] for a in range(num_agents)] # last_room[a] : sala asociada a esa última acción
+
+        # Ajustar estado si hay solución previa - logica get_past_actions pero sin SMT
+        if previous_sol is not None:
+            for a in range(num_agents):
+                prev = previous_sol["agt"][a] # prev contiene [ prev["id"] → lista de acciones pasadas, prev["t"]  → lista de tiempos]
+
+                nfdp = 1
+                for ind, tval in enumerate(prev["t"]): 
+                    
+                    # Se avanza DP a DP
+                    nfdp = ind + 1
+
+                    # Caso 1: se permiten puntos libres
+                    if self.free_action_points:
+                        # No replantear acciones ya activas en curr_time
+                        if tval >= curr_time:
+                            break
+                    else:
+                        #  Mismo criterio que get_past_actions
+                        if tval == curr_time and prev["id"][ind + 1 ] == a:
+                            break
+
+                    # Si el siguiente decision point es "home" (id == agent_id),
+                    # significa que el plan anterior ya no tiene acciones reales.
+                    # A partir de aquí podemos replanificar.      
+                    if len(prev["t"]) > ind + 1 and prev["id"][ind + 1] == a:
+                        break
+
+                # Guardamos el primer dp libre
+                next_free_dp[a] = nfdp
+
+                # Último punto comprometido
+                li = max(0, nfdp - 1)
+                last_time[a] = prev["t"][li]
+                last_action[a] = prev["id"][li]
+
+                # Obtener la sala asociada a la última acción
+                last_room[a] = self.action_room.get(last_action[a], self.action_room[a])
+
+        # Funciones de distancia usada por greedy - debe ser consistente con DistFunc en SMT, o el greedy estimará mal y SMT devolverá UNSAT
+        def dist(r1, r2):
+            return int(math.ceil(self.room_graph[r1][r2] / self.fidelity))              
+
+
+        # Preparación del batch actual
+        base_offset = self.num_actions # Primer action_id libre global
+
+        # Plan futuro decidido por el greedy (solo acciones nuevas)
+        plan_actions = {a: [] for a in range(num_agents)}
+
+        # Asignación tarea -> agente (para el batch actual)
+        task_to_agent = [-1 for _ in range(len(tasks))]
+
+        # Registrar en action_rooms los pickup/dropoff del batch actual
+        for i, task in enumerate(tasks):
+            pickup_id = base_offset + 2 * i
+            dropoff_id = pickup_id + 1
+            self.action_room[pickup_id] = task.start
+            self.action_room[dropoff_id] = task.end
+
+        # Greedy principal (append-only en orden de llegada). Para cada tarea:
+        #   - se evalúa el "finish time" en cada agente
+        #   - se asigna al que termine antes
+        #   - se apendea pickup+drop al final de su cola
+        for i, task in enumerate(tasks):
+            best_a = None
+            best_finish = None
+
+            for a in range(num_agents):
+                # El agente no puede empezar antes de curr_time
+                available = max(last_time[a], curr_time)
+
+                # Tiempo estimado de pickup
+                t_pick = ( available + dist(last_room[a], task.start) + self.action_time)
+
+                # Tiempo estimado de dropoff (finish time)
+                t_drop = ( t_pick + dist(task.start, task.end) + self.action_time )
+
+                # Elegimos el agente con menor tiempo de fidelización
+                if best_finish is None or t_drop < best_finish:
+                    best_finish = t_drop
+                    best_a = a
+            
+            # Commit de la decisión greedy
+            task_to_agent[i] = best_a
+            pickup_id = base_offset + 2 * i
+            dropoff_id = pickup_id + 1
+            
+            # Append-only: se añade siempre al final
+            plan_actions[best_a].extend([pickup_id, dropoff_id])
+
+            # Actualizar el estado estimado del agente elegido
+            last_time[best_a] = best_finish
+            last_room[best_a] = task.end
+
+        return plan_actions, task_to_agent, next_free_dp
+
+    def add_task_constraints_fixed_plan(self, agents, tasks, num_aps, curr_time, curr_max_time, task_set_k, sol, fidelity, plan_actions, task_to_agent):
+        """
+        Opción 1: Greedy decide el plan (qué acciones van en qué orden),
+        SMT NO decide el orden, solo:
+
+        - congela el pasado
+        - calcula tiempos coherentes
+        - verifica deadlines y consistencia
+
+        Este método:
+        - sustituye a add_task_constraints (el original)
+        - mantiene el mismo patrón incremental (pop -> add -> push)
+        - fija explícitamente agt_action[a][t] según plan_actions
+        """
+
+        # 1) Limpiar constraints temporales del batch anterior
+        if self.s.num_scopes() > 0:
+            self.s.pop()
+        assert self.s.num_scopes() == 0
+        assert curr_time >= 0
+
+        num_agents = len(agents)
+        num_tasks = len(tasks)
+
+        # Esta lista recogera todas las restricciones que queremos poder eliminar en el siguiente batch
+        constraints_to_pop = []
+
+        # Representación del tiempo actual compatible con SMT
+        curr_time_val = (BitVecVal(curr_time, self.time_bit) if self.theory == "QF_UFBV" else curr_time)
+
+        # Offset global de action_id para este batch
+        base_offset = self.num_actions
+
+        # 2) Crear variables SMT para las tareas del batch actual
+        #    - task_start[i] : tiempo del pickup de la tarea i
+        #    - task_drop[i] : tiempo del dropoff de la tarea i
+        #    - t2a[i] : agente asignado a la tarea i
+
+        task_start, task_drop, t2a = self.create_task_vars(num_tasks, task_set_k)
+
+        # 3) Definir action_id -> room_id en SMT (RoomFunc). Esto hace que:
+        #    RoomFunc(pickup_id)  = sala de inicio
+        #    RoomFunc(dropoff_id)  = sala de destino
+        # Version SMT del action_room del greedy
+
+        room_defs = []
+        for i in range(num_tasks):
+            pickup_id = base_offset + 2 * i
+            dropoff_id = pickup_id + 1
+
+            room_defs += [self.RoomFunc(pickup_id) == tasks[i].start, self.RoomFunc(dropoff_id) == tasks[i].end]
+
+        self.s.add(room_defs)
+
+        # 4) Fijar t2a segun el Greedy
+        for i in range(num_tasks):
+            self.s.add(t2a[i] == task_to_agent[i])
+        
+        num_assigned_dps = 0
+        
+        # 5) Por cada agente:
+        #    - congelar el pasado (get_past_actions)
+        #    - fijar el FUTURO según plan_actions
+        #    - mantener propagación temporal SMT
+        
+        for agent_id in range(num_agents):
+            # 5.1 Congelar el pasado del agente. Devuelve:
+            #   - assertions: igualdades sobre agt_time/agt_action/agt_cap
+            #   - next_free_dp: primer DP libre
+
+            assertions, next_free_dp = self.get_past_actions(agent_id, sol, curr_time)
+            self.s.add(assertions)
+
+            # Cada DP congelado genera 3 assertions (time, action, cap)
+            num_assigned_dps += len(assertions) // 3
+
+            # 5.2 Fijar las acciones futuras (Greedy)
+            # A partir de next_free_dp:
+            #   - imponemos exactamente la secuencia greedy
+            #   - el resto de DPs se mandan a "home"
+            seq = plan_actions.get(agent_id , [])
+            for k, act_id in enumerate(seq):
+                t = next_free_dp + k
+                if t>= num_aps:
+                    raise ValueError(f"Plan greedy excede num_aps = {num_aps}"
+                                     f"(agente = {agent_id}, next_free_dp = {next_free_dp})"
+                    )
+                constraints_to_pop.append(self.agt_action[agent_id][t] == act_id)
+            
+            for t in range (next_free_dp + len(seq), num_aps): # Rellenar ap vacios con home
+                # Action home = no hace nada
+                constraints_to_pop.append(self.agt_action[agent_id][t] == agent_id)
+
+            # ----------------------------------------
+            # 5.3 SEMÁNTICA SMT Y PROPAGACIÓN DE TIEMPOS
+            #
+            # Aunque el orden está fijado, SMT sigue:
+            #   - calculando tiempos
+            #   - validando coherencia pickup/drop
+            # ----------------------------------------
+            for t in range(next_free_dp, num_aps):
+                # Validez del Action Point
+                constraints_to_pop.append(
+                    Implies(
+                        self.agt_action[agent_id][t] != agent_id, #Si agent_id en t no esta en home
+                        And(self.agt_action[agent_id][t] >= num_agents, # Debe tener un valor > num_agents
+                            self.agt_action[agent_id][t] < base_offset + num_tasks * 2, # Debe estar dentro del rango de tareas
+                        ),
+                    )
+                )
+            
+                # Enlace pickup/drop con variables de tarea
+                for n in range(num_tasks):
+                    pickup_id = base_offset + 2 * n
+                    dropoff_id = pickup_id + 1
+
+                    # Si har pickup, debe haber drop más adelante - Solo forzar a acciones greedy
+                    future_acts = self.agt_action[agent_id][t + 1 : next_free_dp + len(seq)]
+
+                    if len(future_acts) == 0:
+                        drop_later = False
+                    else:
+                        drop_later = Or([act == dropoff_id for act in future_acts])
+
+                    self.s.add(
+                        Implies(
+                            self.agt_action[agent_id][t] == pickup_id,
+                            And(
+                                task_start[n] == self.agt_time[agent_id][t],
+                                drop_later,
+                            )
+                        ),
+                    )
+
+                    # Si hay dropoff, fijamos task_drop y t2a
+                    self.s.add(
+                        Implies(
+                            self.agt_action[agent_id][t] == dropoff_id,
+                            And(
+                                task_drop[n] == self.agt_time[agent_id][t],
+                                t2a[n] == agent_id,
+                            )
+                        )
+                    )
+                # Programación temporal
+                last_room = self.RoomFunc(self.agt_action[agent_id][t-1])
+                current_room = self.RoomFunc(self.agt_action[agent_id][t])
+                travel_time = self.DistFunc(last_room, current_room)
+                prev_time = self.agt_time[agent_id][t-1]
+
+                constraints_to_pop.append(
+                    Implies(
+                        self.agt_action[agent_id][t] >= num_agents, # Si el agente ejecuta una acción real en el punto t
+                        # Un agente no puede empezar una acción antes del tiempo actual del sistema.
+                        self.agt_time[agent_id][t] == If(prev_time <= curr_time, curr_time_val, prev_time) + travel_time + self.action_time, # Tiempo anterior +  tiempo viaje + tiempo de ejecución de la acción
+                    )
+                )
+        # Propagación de tiempos para acciones "reales" (deadlines, etc.)
+        for i in range(num_tasks):
+            pickup_id = base_offset + 2 * i
+
+            for agent_id in range(num_agents):
+                agent_starts_task = Or([self.agt_action[agent_id][j] == pickup_id for j in range(1, self.num_aps)])
+                self.s.add(Implies(t2a[i] == agent_id, agent_starts_task))
+
+            self.s.add(t2a[i] >= 0)
+            self.s.add(t2a[i] < num_agents)
+
+            self.s.add(task_start[i] >= curr_time)
+            self.s.add(task_drop[i] >= task_start[i])
+            self.s.add(task_drop[i] <= math.floor(tasks[i].get_deadline(self.default_deadline) / fidelity))
+
+        # Push/pop: lo "poppable" (futuro fijado + dinámica temporal)
+        self.s.push()
+        for c in constraints_to_pop:
+            self.s.add(c)
+        
+        # Avanzar offset global de action_ids
+        self.num_actions += num_tasks * 2
+
+        return num_assigned_dps
 
 if __name__ == '__main__':
     args = parser.parse_args()
