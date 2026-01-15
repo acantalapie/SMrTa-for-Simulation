@@ -116,8 +116,7 @@ class MRTASolver:
         self.previous_sol = None
         self.current_sol = None
         self.old_batch_params = None
-        self.current_batch_params = None
-        
+        self.current_batch_params = None       
 
     def allocate_task_stream(self, basename=None):
         times = []
@@ -633,11 +632,17 @@ class MRTASolver:
             dropoff_id = pickup_id + 1
             self.action_room[pickup_id] = task.start
             self.action_room[dropoff_id] = task.end
+        
+        """
+        A partir de aqui determinar el metodo de selección:
 
-        # Greedy principal (append-only en orden de llegada). Para cada tarea:
-        #   - se evalúa el "finish time" en cada agente
-        #   - se asigna al que termine antes
-        #   - se apendea pickup+drop al final de su cola
+        (A) Greedy principal (append-only en orden de llegada).
+            Para cada tarea:
+            - se evalúa el "finish time" en cada agente
+            - se asigna al que termine antes
+            - se apendea pickup+drop al final de su cola
+
+        """
         for i, task in enumerate(tasks):
             best_a = None
             best_finish = None
@@ -656,7 +661,7 @@ class MRTASolver:
                 if best_finish is None or t_drop < best_finish:
                     best_finish = t_drop
                     best_a = a
-            
+                                                                                                                                                        
             # Commit de la decisión greedy
             task_to_agent[i] = best_a
             pickup_id = base_offset + 2 * i
