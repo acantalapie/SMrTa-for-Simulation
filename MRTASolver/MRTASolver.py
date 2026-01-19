@@ -17,6 +17,16 @@ import json
 import sys
 import math
 
+
+class AssignmentState:
+    def __init__(self, num_agents):
+        self.num_agents = num_agents
+        self.next_free_dp = [1 for _ in range(num_agents)]
+        self.last_time = [0 for _ in range(num_agents)]
+        self.last_action = [a for a in range(num_agents)]
+        self.last_room = [None for _ in range(num_agents)]
+
+
 class MRTASolver:
     """
     A class to solve the Multi-Robot Task Allocation problem using the Z3 SMT solver.
@@ -84,7 +94,7 @@ class MRTASolver:
         self.incremental = incremental
         self.debug = debug
         self.action_time = 1
-        self.fidelity = 1
+        self.fidelity = fidelity
         self.timeout = timeout
         self.solver_name = solver_name
         self.room_graph = room_graph
@@ -549,7 +559,6 @@ class MRTASolver:
         self.num_actions += num_tasks * 2
         return num_assigned_dps
                 
-    def greedy_append_only_earliest_finish(self, tasks, curr_time, previous_sol=None):
         """
         Greedy (append-only): asigna cada tarea al agente cuyo "finish time" estimado sea menor,
         añadiendo siempre pickup+drop al FINAL de su cola futura.
@@ -853,6 +862,177 @@ class MRTASolver:
 
         return num_assigned_dps
 
+    def _reconstruct_agent_state(self, curr_time, previous_sol):
+        """
+        Reconstruye el estado observable de cada agente curr_time, sin usar SMT.
+
+        Esta información se encapsula en un AssignmentState y se usa
+        posteriormente por los métodos de asignación (greedy u otros).
+        """
+
+
+        # Número total de agentes
+        num_agents = len(self.agents)
+
+        # Estructura que contendrá el estado reconstruido de cada agente
+        state = AssignmentState(num_agents)
+
+        # Infraestructura auxiliar: action_id -> room_id
+        # action_room permite traducir una acción (home / pickup / drop)
+        # a la sala física en la que se encuentra el agente tras ejecutarla.
+        if not hasattr(self, "action_room"):
+            self.action_room = {a.id: a.start for a in self.agents}
+
+        # Estado por defecto: cada agente se considera incialmente a "home"
+        for a in range(num_agents):
+            state.last_room[a] = self.action_room[a]
+
+        # Si no existe solución previa, todos los agnetes estan en su estado incial
+        if previous_sol is None:
+            return state
+
+        # -------------------------------------------------
+        # Reconstrucción estado a partir de solución previa
+        for a in range(num_agents):
+            # Información del agente 'a' en la solución anterior
+            # prev["t"]  -> tiempos en cada DP
+            # prev["id"] -> action_id ejecutada en cada DP
+            prev = previous_sol["agt"][a]
+
+            nfdp = 1
+            # Recorremos los decision int del plan previo
+            for ind, tval in enumerate(prev["t"]):
+                nfdp = ind + 1
+
+                # Caso 1: se permite liberar action points (free_action_points)
+                # En este caso, dejamos de congelar el plan cuando encontramos una acción cuyo tiempo es >= curr_time (acción futura).
+                if self.free_action_points:
+                    if tval >= curr_time:
+                        break
+                
+                # Caso 2: no se permiten action points libres
+                # Reproducimos la lógica de get_past_actions: si la acción ocurre exactamente en curr_time y el
+                # siguiente DP es home, se considera comprometido.
+                else:
+                    if ( tval == curr_time and len(prev["t"]) > ind + 1 and prev["id"][ind + 1] == a):
+                        break
+
+                # Si el siguiente DP es "home", significa que el plan anterior ya no tiene acciones reales más allá.
+                # A partir de aquí se puede replanificar.
+                if len(prev["t"]) > ind + 1 and prev["id"][ind + 1] == a:
+                    break
+            
+            # Guardamos el primer DP libre para el agente "a"
+            state.next_free_dp[a] = nfdp
+
+            # Indice del ultimo DP realmente comprometido
+            li = max(0, nfdp - 1)
+
+            # Tiempo estimado en ese último DP comprometido
+            state.last_time[a] = prev["t"][li]
+
+            # Ultima accion ejecutada por el agente
+            state.last_action[a] = prev["id"][li]
+
+            # Sala asociada a la última acción.
+            # Si la acción no esta en action_room se asume que el agente sigue en su home
+            state.last_room[a] = self.action_room.get(state.last_action[a], self.action_room[a])
+        
+        # Devuelve el estado completamente reconstruido
+        return state
+    
+    def _init_batch_plan(self, tasks):
+        """
+        Inicializa las estructuras comunes necesarioas para planificar
+        el batch actual de tareas. Se prepara la infraestructura para que
+        cualquier método de asginación para poder operar de forma uniforme.
+
+        Devuelve:
+            - plan_actions: dict[agent_id -> list[action_id]]
+                Acciones futuras (pickup/dropoff) planificadas para cada agente.
+            - task_to_agent: list[int]
+                Asignación tarea (índice local del batch) -> agent_id.
+            - base_offset: int
+                Primer action_id libre global para este batch.
+        """
+        num_agents = len(self.agents)
+
+        # Offset global de action_id
+        # self.num_actions indica cuántos action_id ya existen
+        # (agents + tareas de batches anteriores).
+        base_offset = self.num_actions
+
+        #Estructura para almacenar el plan futuro
+        plan_actions = {a: [] for a in range(num_agents)}
+
+        # Asignación tarea -> agente para el batch actual.
+        task_to_agent = [ -1 for _ in range(len(tasks))]
+
+        # Registro de action_id -> room_id para el batch actual
+        # Cada tarea genera dos action_id consecutivos:
+            #   - pickup_id  -> sala de inicio
+            #   - dropoff_id -> sala de destino
+        for i, task in enumerate(tasks):
+            pickup_id = base_offset + 2 * i
+            dropoff_id = pickup_id + 1
+
+            # Registra en el mapa global de action_id -> room_id
+            self.action_room[pickup_id] = task.start
+            self.action_room[dropoff_id] = task.end
+
+        return plan_actions, task_to_agent, base_offset
+    
+    def _commit_assignment(self, agent_id, task, task_index, state, plan_actions, task_to_agent, base_offset):
+        """
+        Aplica (commitea) una decisión de asignación al plan y al estado_
+            - Se registra que una tarea se asgina a un agente
+            - Se traduce esa decisión a action_id concretos
+            - Se actualiza el estado observable del agente
+        """
+        # Calculo de los action_id asociados a esta tarea
+        pickup_id = base_offset + 2 * task_index
+        dropoff_id = pickup_id + 1
+
+        # Registrar la asiganción tarea -> agente
+        task_to_agent[task_index] = agent_id
+
+        # Añadir las acciones futuras al plan del agente
+        # El método de asignación decide *a qué agente* va la tarea,
+        # pero el framework decide *cómo se representa* esa decisión.
+        plan_actions[agent_id].extend([pickup_id, dropoff_id])
+
+        # Actualizar estado estimado del agente
+        state.last_room[agent_id] = task.end
+    
+    def assign_tasks(self, tasks, curr_time, previous_sol, assignment_policy):
+        """
+        Marco genérico de asignación de tareas.
+        El método concreto viene dad por assigment_policy
+        """
+
+        # (1) Reconstruir el estado de agentes
+        state = self._reconstruct_agent_state(curr_time, previous_sol)
+
+        # (2) Inicializar batch
+        plan_actions, task_to_agent, base_offset = self._init_batch_plan(tasks)
+
+        # (3) Orden de tareas (decidido por la policy)
+        task_order = assignment_policy.task_order(tasks, state)
+
+        # (4) Asignación iterativa
+        for task_index in task_order:
+            task = tasks[task_index]
+
+            agent_id = assignment_policy.select_agent(task = task, state = state, curr_time = curr_time)
+
+            # Commit comun
+            self._commit_assignment(agent_id, task, task_index, state, plan_actions, task_to_agent, base_offset)
+
+            # Hook opcional (actualizar tiempos)
+            assignment_policy.on_commit(agent_id, task, state)
+
+        return plan_actions, task_to_agent, state.next_free_dp
+    
 if __name__ == '__main__':
     args = parser.parse_args()
 
