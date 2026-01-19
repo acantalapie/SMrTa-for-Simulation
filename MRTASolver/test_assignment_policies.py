@@ -22,6 +22,7 @@ from .assignment.round_robin import RoundRobinAssigment
 
 
 def simple_room_graph():
+    # 4 habitaciones, matriz simétrica con diagonales 0
     return [
         [0, 2, 5, 6],
         [2, 0, 3, 5],
@@ -30,16 +31,26 @@ def simple_room_graph():
     ]
 
 def build_solver(room_graph, agents, tasks_stream):
+    room_graph = simple_room_graph()
+    agents = [Robot(0, 0), Robot(1, 1)]
+
+    tasks_stream = [
+        ([Task(0, 2, 3, deadline=30), Task(1, 3, 0, deadline=35)], 0),
+        ([Task(2, 2, 1, deadline=50), Task(3, 0, 2, deadline=55)], 10),
+    ]
+
+
     num_aps = 10
     aps_list = [6, 8, 10]
+    capacity = 2
 
-    return MRTASolver(
+    solver = MRTASolver(
         solver_name="bitwuzla",
         theory="QF_UFBV",
         agents=agents,
         tasks_stream=tasks_stream,
         room_graph=room_graph,
-        capacity=10,
+        capacity=capacity,
         num_aps=num_aps,
         fidelity=1,
         free_action_points=True,
@@ -49,6 +60,10 @@ def build_solver(room_graph, agents, tasks_stream):
         incremental=True,
         debug=False,
     )
+    # 🔧 FIX: inicializar llegadas reales (tester no simula ejecución real)
+    solver.actual_agent_arrivals = [[] for _ in range(len(agents))]
+
+    return solver
 
 def format_solution_table(sol, tasks_stream):  
     """  
@@ -92,17 +107,20 @@ def format_solution_table(sol, tasks_stream):
     
     # return task_info   
 
-def run_policy(policy_name, policy, base_solver, tasks_stream, agents):
+def run_policy(policy_name, solver, tasks_stream, agents):
     print(f"\n==============================")
     print(f"Policy: {policy_name}")
     print(f"==============================")
-
-    solver = base_solver.clone() if hasattr(base_solver, 'clone') else base_solver
 
     previous_sol = None
     partial_stream = []
     num_tasks_total = 0
     curr_max_deadline = 0
+
+    if policy_name == "GreedyEFT":
+        policy = GreedyEarliestFinish(solver.room_graph, solver.fidelity, solver.action_time) 
+    else:
+        policy = RoundRobinAssigment()
 
     for k, (tasks, curr_time) in enumerate(tasks_stream):
         partial_stream.append((tasks, curr_time))
@@ -165,20 +183,11 @@ def main():
         ([Task(2, 2, 1, deadline=50), Task(3, 0, 2, deadline=55)], 10),
     ]
 
-    base_solver = build_solver(room_graph, agents, tasks_stream)
+    policies = ["GreedyEFT", "RoundRobin"]
 
-    policies = {
-        "RoundRobin": RoundRobinAssigment(),
-        "GreedyEFT": GreedyEarliestFinish(
-            room_graph=room_graph,
-            fidelity=1,
-            action_time=base_solver.action_time,
-        ),
-    }
-
-    for name, policy in policies.items():
-        run_policy(name, policy, base_solver, tasks_stream, agents)
-
+    for policy_name in policies:
+        base_solver = build_solver(room_graph, agents, tasks_stream)  # ✅ NUEVO solver
+        run_policy(policy_name, base_solver, tasks_stream, agents)
 
 if __name__ == "__main__":
     main()
