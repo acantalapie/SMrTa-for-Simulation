@@ -1033,6 +1033,134 @@ class MRTASolver:
 
         return plan_actions, task_to_agent, state.next_free_dp
     
+
+        """
+        Greedy (append-only): asigna cada tarea al agente cuyo "finish time" estimado sea menor,
+        añadiendo siempre pickup+drop al FINAL de su cola futura.
+
+        Returns:
+            plan_actions: dict[int, list[int]]
+                plan_actions[a] = [action_id_0, action_id_1, ...] (solo acciones futuras)
+            task_to_agent: list[int]
+                task_to_agent[i] = agente asignado a la tarea local i del batch actual
+            next_free_dp: list[int]
+                next_free_dp[a] = primer decision point libre (según previous_sol/curr_time)
+        """
+        num_agents = len(self.agents)
+
+        # Mapa Python-side: action_id -> room_id (evaluación distancias en Greedy)
+        # Se rellena incrementalmente por batches
+        if not hasattr(self, "action_room"):
+            self.action_room = {a.id: a.start for a in self.agents}
+
+        # Calcular next_free_dp y esta "último comprometido" por agente - Estado inicial por agente
+        next_free_dp = [1 for _ in range(num_agents)] # next_free_dp[a] : primer decision point libre
+        last_time = [0 for _ in range(num_agents)] # last_time[a] : tiempo estimado al llegar a ese punto
+        last_action = [a for a in range(num_agents)] # last_action[a] : última acción ejecutada
+        last_room = [self.action_room[a] for a in range(num_agents)] # last_room[a] : sala asociada a esa última acción
+
+        # Ajustar estado si hay solución previa - logica get_past_actions pero sin SMT
+        if previous_sol is not None:
+            for a in range(num_agents):
+                prev = previous_sol["agt"][a] # prev contiene [ prev["id"] → lista de acciones pasadas, prev["t"]  → lista de tiempos]
+
+                nfdp = 1
+                for ind, tval in enumerate(prev["t"]): 
+                    
+                    # Se avanza DP a DP
+                    nfdp = ind + 1
+
+                    # Caso 1: se permiten puntos libres
+                    if self.free_action_points:
+                        # No replantear acciones ya activas en curr_time
+                        if tval >= curr_time:
+                            break
+                    else:
+                        #  Mismo criterio que get_past_actions
+                        if tval == curr_time and prev["id"][ind + 1 ] == a:
+                            break
+
+                    # Si el siguiente decision point es "home" (id == agent_id),
+                    # significa que el plan anterior ya no tiene acciones reales.
+                    # A partir de aquí podemos replanificar.      
+                    if len(prev["t"]) > ind + 1 and prev["id"][ind + 1] == a:
+                        break
+
+                # Guardamos el primer dp libre
+                next_free_dp[a] = nfdp
+
+                # Último punto comprometido
+                li = max(0, nfdp - 1)
+                last_time[a] = prev["t"][li]
+                last_action[a] = prev["id"][li]
+
+                # Obtener la sala asociada a la última acción
+                last_room[a] = self.action_room.get(last_action[a], self.action_room[a])
+
+        # Funciones de distancia usada por greedy - debe ser consistente con DistFunc en SMT, o el greedy estimará mal y SMT devolverá UNSAT
+        def dist(r1, r2):
+            return int(math.ceil(self.room_graph[r1][r2] / self.fidelity))              
+
+
+        # Preparación del batch actual
+        base_offset = self.num_actions # Primer action_id libre global
+
+        # Plan futuro decidido por el greedy (solo acciones nuevas)
+        plan_actions = {a: [] for a in range(num_agents)}
+
+        # Asignación tarea -> agente (para el batch actual)
+        task_to_agent = [-1 for _ in range(len(tasks))]
+
+        # Registrar en action_rooms los pickup/dropoff del batch actual
+        for i, task in enumerate(tasks):
+            pickup_id = base_offset + 2 * i
+            dropoff_id = pickup_id + 1
+            self.action_room[pickup_id] = task.start
+            self.action_room[dropoff_id] = task.end
+        
+        """
+        A partir de aqui determinar el metodo de selección:
+
+        (A) Greedy principal (append-only en orden de llegada).
+            Para cada tarea:
+            - se evalúa el "finish time" en cada agente
+            - se asigna al que termine antes
+            - se apendea pickup+drop al final de su cola
+
+        """
+        for i, task in enumerate(tasks):
+            best_a = None
+            best_finish = None
+
+            for a in range(num_agents):
+                # El agente no puede empezar antes de curr_time
+                available = max(last_time[a], curr_time)
+
+                # Tiempo estimado de pickup
+                t_pick = ( available + dist(last_room[a], task.start) + self.action_time)
+
+                # Tiempo estimado de dropoff (finish time)
+                t_drop = ( t_pick + dist(task.start, task.end) + self.action_time )
+
+                # Elegimos el agente con menor tiempo de fidelización
+                if best_finish is None or t_drop < best_finish:
+                    best_finish = t_drop
+                    best_a = a
+                                                                                                                                                        
+            # Commit de la decisión greedy
+            task_to_agent[i] = best_a
+            pickup_id = base_offset + 2 * i
+            dropoff_id = pickup_id + 1
+            
+            # Append-only: se añade siempre al final
+            plan_actions[best_a].extend([pickup_id, dropoff_id])
+
+            # Actualizar el estado estimado del agente elegido
+            last_time[best_a] = best_finish
+            last_room[best_a] = task.end
+
+        return plan_actions, task_to_agent, next_free_dp
+
 if __name__ == '__main__':
     args = parser.parse_args()
 
