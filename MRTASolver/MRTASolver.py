@@ -128,7 +128,6 @@ class MRTASolver:
         self.old_batch_params = None
         self.current_batch_params = None
         
-
     def allocate_task_stream(self, basename=None):
         times = []
         results = []
@@ -178,7 +177,7 @@ class MRTASolver:
                   'curr_max_time': curr_max_time}
         return action_counts, params
 
-    def allocate_task_set(self, iteration, previous_sol, old_params, basename=None):
+    def allocate_task_set_old(self, iteration, previous_sol, old_params, basename=None):
         if old_params == None:
             old_params = {'num_tasks': 0,
                         'min_dps': 1,
@@ -199,6 +198,88 @@ class MRTASolver:
         else:
             self.export_benchmark(basename)
             return action_counts, None, None, None, new_params
+
+    def allocate_task_set(self, iteration, previous_sol, old_params, basename=None):
+        """
+        Nueva versión adaptada a la arquitectura:
+            policy decide → SMT valida (fixed-plan)
+
+        Mantiene la firma para no romper el simulador.
+        """
+
+        # -------------------------------
+        # (0) Inicialización de parámetros de batch
+        # -------------------------------
+        if old_params is None:
+            old_params = {
+                'num_tasks': 0,
+                'min_dps': 1,
+                'curr_time': 0,
+                'curr_max_deadline': 0,
+                'curr_max_time': 0
+            }
+
+        tasks, curr_time = self.tasks_stream[iteration]
+
+        # Actualizar máximos temporales
+        curr_max_deadline = max([t.get_deadline(self.default_deadline) for t un tasks] + [old_params['curr_max_deadline']])
+        curr_max_time = curr_max_deadline + self.max_travel_time
+
+        # (1) Decisión: policy decide el plan
+        plan_actions, task_to_agent, next_free_dp = self.assign_tasks(
+            tasks = tasks,
+            curr_time = curr_time,
+            previous_sol = previous_sol,
+            assignment_policy = self.assignment_policy
+        )
+
+        # Actualiza contadores globales
+        num_tasks = old_params['num_tasks'] + len(tasks)
+        min_dps = self.get_min_dps(len(self.agents), num_tasks)
+
+        # (2) SMT: fijar el plan (fixed-plan)
+        num_assigned_dps = self.add_task_constraints_fixed_plan(
+            agents = self.agents,
+            tasks = tasks,
+            num_aps = self.num_aps,
+            curr_time = curr_time,
+            curr_max_time = curr_mas_time,
+            task_set_k = iteration,
+            sol = previous_sol,
+            fidelity = sel.fidelity,
+            plan_actions = plan_actions,
+            task_to_agent = task_to_agent
+        )
+
+        num_unassigned_actions = self.num_actions - num_assigned_dps
+        action_counts = (num_assigned_dps, num_unassigned_actions)
+
+        new_params = {
+            'num_tasks': num_tasks,
+            'min_dps':min_dps,
+            'curr_time':curr_time,
+            'curr_max_deadline':curr_max_deadline,
+            'curr_max_time':curr_max_time
+        }
+        # (3) Resolver con SMT
+        if basename is None:
+            solvetimes, results, result, solver = self.solve_task_allocation( num_task = new_params["num_tasks"], min_dps = new_params["min_dps"])
+
+            # (4) Validar y extraer solución
+            if result == Result.stat:
+                self.debug_print("Validating soluction (fixed-plan) ... ")
+                sol = self.validate_task_allocation(previous_sol, self.tasks_stream[:iterarion + 1], solver, curr_time, curr_max_time)
+            else:
+                sol = None
+                self.debug_print("Unsatisfiable (fixed-plan)")
+
+            return action_counts, solvetimes, results, result, sol, new_params
+        
+        else:
+            # Export benchmark (sin resolver)
+            self.export_benchmark(basename)
+            return action_counts, None, None, None, None, new_params
+
 
     def solve_task_allocation(self, num_tasks, min_dps):
         batch_times = []
