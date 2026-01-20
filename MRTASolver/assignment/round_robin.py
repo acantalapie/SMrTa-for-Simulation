@@ -16,7 +16,7 @@ class RoundRobinAssigment(AssignmentPolicy):
       - referencia para comparar otros métodos
       - herramienta de depuración del pipeline (greedy + SMT)
     """
-    def __init__(self):
+    def __init__(self, **_):
         self.counter = 0
 
     def select_agent(self, task, state, curr_time):
