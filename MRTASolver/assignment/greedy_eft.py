@@ -3,7 +3,7 @@ import math
 
 class GreedyEarliestFinish(AssignmentPolicy):
 
-    def __init__(self, room_graph, fidelity, action_time):
+    def __init__(self, room_graph, fidelity, action_time. **_):
         self.room_graph = room_graph
         self.fidelity = fidelity
         self.action_time = action_time
