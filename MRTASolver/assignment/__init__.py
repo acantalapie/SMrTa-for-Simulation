@@ -1,5 +1,5 @@
 from .greedy_eft import GreedyEarliestFinish
-from .round_robin.py import RoundRobinAssigment
+from .round_robin import RoundRobinAssigment
 
 POLICY_REGISTRY = {
     "greedy_earliest_finish" : GreedyEarliestFinish,
