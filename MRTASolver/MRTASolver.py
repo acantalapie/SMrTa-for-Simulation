@@ -81,7 +81,7 @@ class MRTASolver:
                  aps_list=None,
                  incremental=True,
                  debug=True,
-                 assignment_policy='greedy_earliest_finish'):
+                 assignment_policy_name='greedy_earliest_finish'):
 
         assert theory in ['QF_UFLIA', 'QF_UFBV']
         self.theory = theory
@@ -109,7 +109,7 @@ class MRTASolver:
             "capacity": self.cap,
             "agents": self.agents,
         }
-        self.assignment_policy = POLICY_REGISTRY[assignment_policy](**solver_params)
+        self.assignment_policy = POLICY_REGISTRY[assignment_policy_name](**solver_params)
 
         if aps_list is None:
             self.variable_dps = False
@@ -330,10 +330,10 @@ class MRTASolver:
         }
         # (3) Resolver con SMT
         if basename is None:
-            solvetimes, results, result, solver = self.solve_task_allocation( num_task = new_params["num_tasks"], min_dps = new_params["min_dps"])
+            solvetimes, results, result, solver = self.solve_task_allocation( num_tasks = new_params["num_tasks"], min_dps = new_params["min_dps"])
 
             # (4) Validar y extraer solución
-            if result == Result.stat:
+            if result == Result.sat:
                 self.debug_print("Validating soluction (fixed-plan) ... ")
                 sol = self.validate_task_allocation(previous_sol, self.tasks_stream[:iteration + 1], solver, curr_time, curr_max_time)
             else:
@@ -1178,7 +1178,7 @@ class MRTASolver:
             # Hook opcional (actualizar tiempos)
             assignment_policy.on_commit(agent_id, task, state)
 
-        return plan_actions, task_to_agent, state.next_free_d
+        return plan_actions, task_to_agent, state.next_free_dp
 
 
 if __name__ == '__main__':
@@ -1195,20 +1195,36 @@ if __name__ == '__main__':
     default_deadline = args.deadline
     incremental = args.incremental
     verbose = args.verbose
-    assignment_policy  = args.assignment_policy
+    assignment_policy_name  = args.assignment_policy_name
 
     agents, tasks_stream = load_config(file)
     num_agents = len(agents)
     tot_tasks = sum([len(tasks) for tasks, _ in tasks_stream])
-    num_aps = math.ceil(tot_tasks / num_agents) * 2 + 1 if args.num_aps is None else args.num_aps
-    aps_list = list(range(3, num_aps+1, 2))
+    # num_aps = math.ceil(tot_tasks / num_agents) * 2 + 1 if args.num_aps is None else args.num_aps
+    # # num_aps = 10
+    # aps_list = list(range(3, num_aps+1, 2))
 
-    room_dictionary = load_weighted_graph()
-    room_count, room_graph = dictionary_to_matrix(room_dictionary)
+    min_dps = math.ceil(tot_tasks / num_agents) * 2 + 1
+    # máximo “seguro” para fixed-plan: todas las tareas en un agente (peor caso)
+    num_aps = 2 * tot_tasks + 1 if args.num_aps is None else args.num_aps
+    # lista para ir probando desde el mínimo hasta el máximo
+    aps_list = list(range(min_dps, num_aps + 1, 2))
 
-    mrtasolver = MRTASolver(solver, theory, agents, tasks_stream, room_graph, capacity, num_aps, fidelity, free_action_points, timeout, basename, default_deadline, aps_list, incremental, verbose, assignment_policy)
+
+    # room_dictionary = load_weighted_graph()
+    # room_count, room_graph = dictionary_to_matrix(room_dictionary)
+
+    room_count = 4
+    room_graph = [
+        [0, 2, 5, 6],
+        [2, 0, 3, 5],
+        [5, 3, 0, 2],
+        [6, 5, 2, 0],
+    ]
+
+    mrtasolver = MRTASolver(solver, theory, agents, tasks_stream, room_graph, capacity, num_aps, fidelity, free_action_points, timeout, basename, default_deadline, aps_list, incremental, verbose, assignment_policy_name)
     # 🔧 FIX: inicializar llegadas reales (tester no simula ejecución real)
-    solver.actual_agent_arrivals = [[] for _ in range(len(agents))]
+    mrtasolver.actual_agent_arrivals = [[] for _ in range(len(agents))]
     mrtasolver.allocate_task_stream()
 
     # # Create your own benchmark here
