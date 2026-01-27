@@ -2,7 +2,7 @@ import argparse
 
 parser = argparse.ArgumentParser(description='SMT-based approach to solve the multirobot task allocation (MRTA) problem.')
 
-parser.add_argument('--file', '-f', type=str, help='Path to the file containing the MRTA problem instance.', required=True)
+parser.add_argument('--file', '-f', type=str, help='Path to the file containing the MRTA problem instance.', required=False)
 parser.add_argument('--solver', '-s', type=str, help='Solver to be used to solve the problem.', default='bitwuzla', choices=['bitwuzla', 'z3', 'cvc5'])
 parser.add_argument('--theory', '-th', type=str, help='Theory to be used to solve the problem.', default='QF_UFBV', choices=['QF_UFBV', 'QF_UFLIA'])
 parser.add_argument('--capacity', '-c', type=int, help='Capacity of the robots.', default=2)
