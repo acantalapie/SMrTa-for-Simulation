@@ -24,7 +24,7 @@ def task_index_from_action(action_id, num_agents):
 # CHECKS
 # --------------------------------------------------
 
-def check_action_id_ranges(plan_actions, base_offset, num_tasks):
+def check_action_id_ranges_old(plan_actions, num_agents, base_offset, num_tasks):
     """
     Verifica que:
       - todos los action_id sean >= num_agents
@@ -48,8 +48,25 @@ def check_action_id_ranges(plan_actions, base_offset, num_tasks):
                 )
     return True
 
+def check_action_id_ranges(plan_actions, num_agents, base_offset, num_tasks):
+    """
+    Verifica que:
+      - no sea home
+      - exista en el universo de acciones ya creadas: [num_agents .. base_offset+2*num_tasks-1]
+    """
+    min_id = num_agents
+    max_id = base_offset + 2 * num_tasks - 1
 
-def check_pickup_before_dropoff(plan_actions, num_agents):
+    for agent_id, actions in plan_actions.items():
+        for act in actions:
+            if act < min_id:
+                raise SanityCheckError(f"Action ID inválido (home o negativo): agent={agent_id}, action={act}")
+            if act > max_id:
+                raise SanityCheckError(f"Action ID no existe aún: agent={agent_id}, action={act}, esperado <= {max_id}")
+    return True
+
+
+def check_pickup_before_dropoff_old(plan_actions, num_agents):
     """
     Para cada agente y cada tarea:
       - pickup aparece antes que dropoff
@@ -78,6 +95,37 @@ def check_pickup_before_dropoff(plan_actions, num_agents):
                     f"task={task_idx}, pickup={pickup_id}, dropoff={act}"
                 )
     return True
+
+def check_pickup_before_dropoff(plan_actions, num_agents, state):
+    """
+    Permite:
+      - dropoff después de pickup en el plan
+      - dropoff aunque el pickup NO esté en el plan,
+        siempre que pickup esté en state.open_pickups[agent]
+    """
+    for agent_id, actions in plan_actions.items():
+        pos = {act: i for i, act in enumerate(actions)}
+        open_pickups = set(state.open_pickups[agent_id])
+
+        for act in actions:
+            if not is_dropoff(act, num_agents):
+                continue
+
+            pickup_id = act - 1
+            
+            # Caso 1: pickup en el plan -> debe ir antes que dropoff
+            if pickup_id in pos:
+                if pos[pickup_id] > pos[act]:
+                    raise SanityCheckError(f"Dropoff antes de pickup: agent={agent_id}, pickup={pickup_id}, dropoff={act}")
+            
+            # Caso 2: pickup NO en el plan -> debe estar en open_pickups
+            else:
+                # Pickup no está en el plan: solo OK si venía abierto del pasado
+                if pickup_id not in open_pickups:
+                    raise SanityCheckError(f"Dropoff sin pickup (ni en plan ni abierto): agent={agent_id}, pickup={pickup_id}, dropoff={act}")
+
+    return True
+
 
 
 def check_task_assigned_once(task_to_agent, num_agents, num_tasks):
@@ -109,7 +157,6 @@ def check_task_assigned_once(task_to_agent, num_agents, num_tasks):
             )
     return True
 
-
 def check_capacity_conservative(state):
     """
     Verifica que el greedy respete:
@@ -125,6 +172,38 @@ def check_capacity_conservative(state):
             )
     return True
 
+def check_capacity_along_plan(plan_actions, num_agents, state):
+    """
+    Capacity: número máximo de tareas simultáneamente activas (pick hechas, drop pendientes)
+    """
+
+    for agent_id, actions in plan_actions.items():
+        open_tasks = state.active_load[agent_id]
+        for act in actions:
+            if is_pickup(act, num_agents):
+                open_tasks += 1
+            elif is_dropoff(act, num_agents):
+                open_tasks -= 1
+
+            if open_tasks < 0:
+                raise SanityCheckError(f"Dropoff sin pickup previo: agent={agent_id}, action={act}")
+            if open_tasks > state.capacity:
+                raise SanityCheckError(f"Capacidad excedida (open_tasks): agent={agent_id}, open={open_tasks}, cap={state.capacity}")
+    return True  
+
+def check_old_actions_are_only_dropoffs_of_open_pickups(plan_actions, base_offset, state, num_agents):
+    for agent_id, actions in plan_actions.items():
+        open_set = set(state.open_pickups[agent_id])
+        for act in actions:
+            if act < base_offset:
+                # Solo permitimos DROP de un pickup abierto: act == pickup+1
+                pickup = act - 1
+                if pickup not in open_set:
+                    raise SanityCheckError(
+                        f"Acción antigua no permitida: agent={agent_id}, act={act}. "
+                        f"No corresponde a un open_pickup."
+                    )
+    return True
 
 # --------------------------------------------------
 # ENTRY POINT
@@ -145,10 +224,13 @@ def run_all_sanity_checks(
     if verbose:
         print("🧪 Running sanity checks...")
 
-    check_action_id_ranges(plan_actions, base_offset, num_tasks)
-    check_pickup_before_dropoff(plan_actions, num_agents)
+    check_action_id_ranges(plan_actions, num_agents,base_offset, num_tasks)
+    check_pickup_before_dropoff(plan_actions, num_agents, state)
     check_task_assigned_once(task_to_agent, num_agents, num_tasks)
-    check_capacity_conservative(state)
+    # check_capacity_conservative(state)
+    check_capacity_along_plan(plan_actions, num_agents, state)
+    check_old_actions_are_only_dropoffs_of_open_pickups(plan_actions, base_offset, state, num_agents)
+
 
     if verbose:
         print("✅ Sanity checks OK")

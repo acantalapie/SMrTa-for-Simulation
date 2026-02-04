@@ -31,6 +31,7 @@ class AssignmentState:
         self.last_action = [a for a in range(num_agents)]
         self.last_room = [None for _ in range(num_agents)]
         self.active_load = [0 for _ in range(num_agents)]
+        self.open_pickups = [[] for _ in range(num_agents)]
 
         # Planificacion del batch
         self.future_actions = [0 for _ in range(num_agents)]  # nº de acciones (pickup/drop) añadidas en este batch
@@ -92,7 +93,7 @@ class MRTASolver:
                  aps_list=None,
                  incremental=True,
                  debug=True,
-                 assignment_policy_name='greedy_earliest_finish'):
+                 assignment_policy_name='greedy_interleaved_chunked'):
 
         assert theory in ['QF_UFLIA', 'QF_UFBV']
         self.theory = theory
@@ -204,6 +205,17 @@ class MRTASolver:
             "└───────────────────────┴─────────────┴─────────────┴──────────────┴──────────┴──────────┴──────────┘"
         )
  
+    def debug_action_time(self, sol, agent_id, action_id):
+        ids = sol["agt"][agent_id]["id"]
+        ts  = sol["agt"][agent_id]["t"]
+        for dp, (a, t) in enumerate(zip(ids, ts)):
+            if a == action_id:
+                print(f"[DEBUG] agent={agent_id} action={action_id} dp={dp} time={t}")
+                return t
+        print(f"[DEBUG] agent={agent_id} action={action_id} NOT FOUND")
+        return None
+
+    
     def allocate_task_stream(self, basename=None):
         times = []
         results = []
@@ -215,6 +227,11 @@ class MRTASolver:
             old_batch_params = copy.deepcopy(batch_params)
             batch_action_counts, batch_solvetimes, batch_results, batch_result, batch_sol, batch_params = self.allocate_task_set(stream_index, previous_sol, old_batch_params, basename)
             previous_sol = batch_sol
+            if stream_index == 0 and previous_sol is not None:
+                self.debug_action_time(previous_sol, 4, 11)
+                self.debug_action_time(previous_sol, 4, 12)
+
+
             times.append(batch_solvetimes)
             results.append(batch_results)
             actions.append(batch_action_counts)
@@ -257,28 +274,6 @@ class MRTASolver:
                   'curr_max_deadline': curr_max_deadline,
                   'curr_max_time': curr_max_time}
         return action_counts, params
-
-    def allocate_task_set_old(self, iteration, previous_sol, old_params, basename=None):
-        if old_params == None:
-            old_params = {'num_tasks': 0,
-                        'min_dps': 1,
-                        'curr_time': 0,
-                        'curr_max_deadline': 0,
-                        'curr_max_time': 0}
-        action_counts, new_params = self.add_task_set_constraints(previous_sol, iteration, self.tasks_stream[iteration], **old_params)
-        if basename is None:
-            solvetimes, results, result, solver = self.solve_task_allocation(new_params['num_tasks'], new_params['min_dps'])
-            if result == Result.sat:
-                curr_time, curr_max_time = new_params['curr_time'], new_params['curr_max_time']
-                print("Validating solution...")
-                sol = self.validate_task_allocation(previous_sol, self.tasks_stream[:iteration+1], solver, curr_time, curr_max_time)
-            else:
-                sol = None
-                self.debug_print('Unsatisfiable')
-            return action_counts, solvetimes, results, result, sol, new_params
-        else:
-            self.export_benchmark(basename)
-            return action_counts, None, None, None, new_params
 
     def allocate_task_set(self, iteration, previous_sol, old_params, basename=None):
         """
@@ -363,6 +358,7 @@ class MRTASolver:
             return action_counts, None, None, None, None, new_params
 
     def solve_task_allocation(self, num_tasks, min_dps):
+        self.dps_index = 0
         batch_times = []
         batch_results = []
 
@@ -499,89 +495,7 @@ class MRTASolver:
         self.task_agents.append(t2a)
         return task_start, task_drop, t2a
 
-    def build_init_constraints_old(self, agents, room_graph, num_aps, capacity, max_time, fidelity):
-        num_agents = len(agents)
-        num_rooms = len(room_graph)
 
-        # Define the behavior of the functions given initial set of tasks
-        dist_defs = [self.DistFunc(i, j) == math.ceil(room_graph[i][j]/fidelity) for i in range(num_rooms) for j in range(num_rooms)]
-        room_defs = [self.RoomFunc(i) == agents[i].start for i in range(num_agents)]
-        self.s.add(room_defs)
-        self.s.add(dist_defs)
-
-        
-        # Constraints for each agent
-        for agent_id in range(num_agents):
-            # Constrain each agent to start and end with a load of 0
-            self.s.add(self.agt_cap[agent_id][0] == 0)
-            # self.s.add(self.agt_cap[agent_id][-1] == 0)
-
-            # Constrain each agent to arrive at its starting position id by time 0
-            self.s.add(self.agt_time[agent_id][0] == 0)
-            self.s.add(self.agt_action[agent_id][0] == agent_id)
-
-            # Constraints on the decision point tuples (agt_time, agt_cap, agent_act)
-            current_dps_ind = 0
-            for t in range(1, num_aps):
-                # Threshold load in [0, capacity]
-                self.s.add(self.agt_cap[agent_id][t] >= 0)
-                self.s.add(self.agt_cap[agent_id][t] <= capacity)
-
-                # Capacity constraints for QF_UFBV
-                # 0 1 2 (3 4)
-                if self.theory == 'QF_UFBV':
-                    one = BitVecVal(1, self.cap_bit)
-                    zero = BitVecVal(0, self.cap_bit)
-                    a = If(And(self.agt_action[agent_id][t] & 1 == num_agents % 2, # 1 or 0
-                               self.agt_action[agent_id][t] >= num_agents),
-                           one, zero)
-                    b = If(And(self.agt_action[agent_id][t] & 1 == abs(num_agents % 2 - 1), # 0 or 1
-                               self.agt_action[agent_id][t] >= num_agents),
-                           one, zero)
-                elif self.theory == 'QF_UFLIA': 
-                    # Note: x % 2 == 0 will probably be translated into x == 2 * k with a fresh int var k
-                    a = If(And(self.agt_action[agent_id][t] % 2 == num_agents % 2, # 1 or 0
-                               self.agt_action[agent_id][t] >= num_agents),
-                           1, 0)
-                    b = If(And(self.agt_action[agent_id][t] % 2 == abs(num_agents % 2 - 1), # 0 or 1
-                               self.agt_action[agent_id][t] >= num_agents),
-                           1, 0)
-                else:
-                    raise NotImplementedError
-                self.s.add(self.agt_cap[agent_id][t] == self.agt_cap[agent_id][t-1] + a - b)
-
-                # CAN BE REMOVED?
-                # THIS CONSTRAINT CANNOT BE ADDED because all times of unused action points are assigned to max_time
-                # which will cause the problem to become unsat if self.action_time != 1
-                # Constrain the current time to be time at the last step plus travel time between the rooms
-                # last_room = self.RoomFunc(self.agt_action[agent_id][t-1])
-                # current_room = self.RoomFunc(self.agt_action[agent_id][t])
-                # travel_time = self.DistFunc(last_room, current_room)
-                # self.s.add(self.agt_time[agent_id][t] >= self.agt_time[agent_id][t-1] + travel_time)
-
-                # Constrain the task ids to be valid ids
-                # Upper bound of task id will change (handled in add_task_constraints)
-                self.s.add(self.agt_action[agent_id][t] >= 0)
-                # Constrain that if an agent returns to its starting task id, it stays there
-                self.s.add(Implies(self.agt_action[agent_id][t] == agent_id,
-                                   self.agt_time[agent_id][t] == max_time))
-                if t != num_aps - 1:
-                    self.s.add(Implies(self.agt_action[agent_id][t] == agent_id, 
-                                       self.agt_action[agent_id][t+1] == agent_id))
-
-                # Constrain that if an agent is not at its starting point, it
-                # 1. will not have the same task id for two consecutive decision points, and
-                # 2. has to be assigned to a task id (not another agent's id)
-                self.s.add(Implies(self.agt_action[agent_id][t] != agent_id, 
-                                   And(self.agt_action[agent_id][t] >= num_agents, 
-                                       self.agt_action[agent_id][t] != self.agt_action[agent_id][t-1])))
-
-                if t == self.aps_list[current_dps_ind]:
-                    self.s.add(Implies(self.assumes[current_dps_ind], self.agt_action[agent_id][t] == agent_id))
-                    current_dps_ind += 1
-
-        self.num_actions = num_agents
-    
     def build_init_constraints(self, agents, room_graph, num_aps, capacity, max_time, fidelity):
         num_agents = len(agents)
         num_rooms = len(room_graph)
@@ -1039,6 +953,7 @@ class MRTASolver:
 
             nfdp = 1
             load = 0 # Carga activa del agente
+            open_stack = []
             # Recorremos los decision int del plan previo
             for ind, tval in enumerate(prev["t"]):
                 nfdp = ind + 1
@@ -1046,10 +961,16 @@ class MRTASolver:
                 act = prev["id"][ind]
                 # Reconstrucción de carga activa (nº de tareas en curso)
                 if act >= num_agents:
-                    if (act - num_agents) % 2 == 0:
-                        load += 1   # pickup
+                    task_local = act - num_agents
+                    if task_local % 2 == 0:
+                        # pickup
+                        open_stack.append(act)
                     else:
-                        load -= 1   # dropoff
+                        # dropoff
+                        pickup_id = act - 1
+                        if pickup_id in open_stack:
+                            open_stack.remove(pickup_id)
+                        # load -= 1   # dropoff
                 # Caso 1: se permite liberar action points (free_action_points)
                 # En este caso, dejamos de congelar el plan cuando encontramos una acción cuyo tiempo es >= curr_time (acción futura).
                 if self.free_action_points:
@@ -1085,8 +1006,12 @@ class MRTASolver:
             state.last_room[a] = self.action_room.get(state.last_action[a], self.action_room[a])
 
             # Guardamos carga activa reconstruida (acotada por seguridad)
-            state.active_load[a] = max(0, load)
-        
+            # state.active_load[a] = max(0, load)
+            state.open_pickups[a] = list(open_stack)
+            state.active_load[a] = len(open_stack)
+
+            state.future_load[a] = 0 
+            state.future_actions[a] = 0
         # Devuelve el estado completamente reconstruido
         return state
     
@@ -1157,7 +1082,7 @@ class MRTASolver:
         state.future_actions[agent_id] += 2
         state.future_load[agent_id] += 1
 
-    def assign_tasks(self, tasks, curr_time, previous_sol, assignment_policy):
+    def assign_tasks_old(self, tasks, curr_time, previous_sol, assignment_policy):
         """
         Marco genérico de asignación de tareas.
         La policy concreta decide:
@@ -1209,6 +1134,94 @@ class MRTASolver:
             raise
 
         return plan_actions, task_to_agent, state.next_free_dp
+
+    def assign_tasks(self, tasks, curr_time, previous_sol, assignment_policy):
+        """
+        Marco genérico de asignación de tareas.
+        La policy concreta decide:
+        - orden de tareas (task_order)
+        - selección de agente (select_agent)
+        - actualización del estado (on_commit)
+        """
+        
+
+        # (1) Reconstruir el estado de agentes
+        state = self._reconstruct_agent_state(curr_time, previous_sol)
+
+        # (2) Inicializar batch
+        plan_actions, task_to_agent, base_offset = self._init_batch_plan(tasks)
+
+        # Si la policy construye el plan completo, úsalo
+        if hasattr(assignment_policy, "build_plan"):
+            built = assignment_policy.build_plan(tasks=tasks, state=state, curr_time=curr_time, base_offset=base_offset)
+            if built is not None:
+
+                plan_actions, task_to_agent = built
+
+                # (Opcional) si quieres que state.future_actions/future_load tengan sentido:
+                for a, seq in plan_actions.items():
+                    state.future_actions[a] = len(seq)
+
+                print("\n🧾 PLAN PROVISIONAL (ANTES DE SANITY CHECKS)")
+                for a, seq in plan_actions.items():
+                    print(f"Agente {a}: {seq}")
+                print("Open pickups:", state.open_pickups)
+                print("Active load:", state.active_load)
+                print("Task to agent:", task_to_agent)
+                print("-" * 60)
+
+                # Sanity checks
+                run_all_sanity_checks(
+                    plan_actions = plan_actions,
+                    task_to_agent = task_to_agent,
+                    state = state,
+                    num_agents = state.num_agents,
+                    num_tasks = len(tasks),
+                    base_offset = base_offset,
+                    verbose = True
+                )
+                return plan_actions, task_to_agent, state.next_free_dp
+        
+        # ------------------- Modo antiguo ---------------------------
+        # (3) Orden de tareas (decidido por la policy)
+        task_order = assignment_policy.task_order(tasks, state)
+
+        # (4) Asignación iterativa
+        for task_index in task_order:
+            task = tasks[task_index]
+
+            deadline = task.get_deadline(self.default_deadline)
+            agent_id = assignment_policy.select_agent(task = task, state = state, curr_time = curr_time , deadline = deadline)
+
+            # Commit comun
+            self._commit_assignment(agent_id, task, task_index, state, plan_actions, task_to_agent, base_offset)
+
+            # Hook opcional (actualizar tiempos)
+            # assignment_policy.on_commit(agent_id, task, state)
+
+            # Hook opcional: actualizar tiempos/carga/etc según policy
+            if hasattr(assignment_policy, "on_commit"):
+                assignment_policy.on_commit(agent_id, task, state, curr_time=curr_time, deadline=deadline)
+        
+        # SANITY CHECKS (solo en modo debug / benchmark)
+        try:
+            run_all_sanity_checks(
+                plan_actions=plan_actions,
+                task_to_agent=task_to_agent,
+                state=state,
+                num_agents=state.num_agents,
+                num_tasks=len(tasks),
+                base_offset=base_offset,
+                verbose=True,
+            )
+        except SanityCheckError as e:
+            print("❌ Sanity check FAILED")
+            print(e)
+            raise
+
+        return plan_actions, task_to_agent, state.next_free_dp
+
+
 """
 if __name__ == '__main__':
     args = parser.parse_args()

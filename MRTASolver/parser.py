@@ -14,4 +14,4 @@ parser.add_argument('--verbose', '-v', action='store_true', help='Prints more in
 parser.add_argument('--fidelity', '-fi', type=int, help='Fidelity of travel time.', default=1)
 parser.add_argument('--deadline', '-d', type=int, help='Default deadline for tasks.', default=100)
 parser.add_argument('--keep_aps', action='store_true', help='Keep previously allocated action points.')
-parser.add_argument('--assignment_policy_name', '-ap', type=str, help='Assignment policy to be used.', default='greedy_earliest_finish', choices=['greedy_earliest_finish', 'round_robin'])
+parser.add_argument('--assignment_policy_name', '-ap', type=str, help='Assignment policy to be used.', default='greedy_interleaved_chunked', choices=['greedy_earliest_finish', 'round_robin' , 'greedy_interleaved_chunked'])
